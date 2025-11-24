@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-import argparse
-import requests
-import csv
-import urllib3
+import time
 import sys
 import re
+import argparse
+import requests
+import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
-import re
-
 
 
 
@@ -19,7 +18,6 @@ class Colors:
     CYAN   = "\033[96m"
     RESET  = "\033[0m"
     BOLD   = "\033[1m"
-
 
 STATIC_DIRS = [
     "static",
@@ -69,10 +67,12 @@ def fetch(url, cookies=None):
         print(f"{Colors.RED}[ERROR] Request failed: {e}{Colors.RESET}")
         sys.exit(1)
 
-def fetch_raw_headers(url):
+
+def fetch_raw_headers(url, cookies=None):
     http = urllib3.PoolManager()
     resp = http.request("GET", url, redirect=False)
     return resp
+
 
 def clean(resp_data):
     try:
@@ -87,7 +87,6 @@ def clean(resp_data):
     text = re.sub(r"[A-Za-z0-9]{32,}", "", text)
 
     return text.strip()
-
 
 def responses_similar(base, modified):
     if base.status != modified.status:
@@ -107,6 +106,7 @@ def responses_similar(base, modified):
         return True
 
     return False
+
 def is_cached(headers):
     cache_indicators = [
         "X-Cache", "CF-Cache-Status", "Age", "X-Proxy-Cache"
@@ -118,14 +118,7 @@ def is_cached(headers):
                 return True
     return False
 
-def delimiter_match(base, modified):
-    return (
-        modified.status_code in (200, 301, 302) and
-        len(modified.text) >= len(base.text) * 0.5
-    )
-
-
-def test_path_mapping_dis(url, base_resp):
+def test_path_mapping_discrepancy(url, base_resp):
     print(f"{Colors.BLUE}{Colors.BOLD}\n[1] Detecting PATH MAPPING discrepancies...{Colors.RESET}")
 
     # Extract endpoint and parent paths
@@ -138,9 +131,9 @@ def test_path_mapping_dis(url, base_resp):
     modified_resp_1 = fetch_raw_headers(test_url_1)
 
     if responses_similar(base_resp, modified_resp_1):
-        print(f"{Colors.GREEN}  ✔ Origin abstracts /{endpoint}/abc → /{endpoint}{Colors.RESET}")
+        print(f"{Colors.GREEN}      ✔ Origin abstracts /{endpoint}/abc → /{endpoint}{Colors.RESET}")
     else:
-        print(f"{Colors.RED}    ✘ Origin DOES NOT abstract path. No mapping discrepancy here.{Colors.RESET}")
+        print(f"{Colors.RED}        ✘ Origin DOES NOT abstract path. No mapping discrepancy here.{Colors.RESET}")
         return False
 
     # 2) Test CACHE BEHAVIOR with static extension: /my-account/abc.js
@@ -152,16 +145,16 @@ def test_path_mapping_dis(url, base_resp):
     cached_before = is_cached(modified_resp_for_cache.headers)
 
     if cached_before:
-        print(f"{Colors.GREEN}  ✔ Response already cached on first request (rare but possible){Colors.RESET}")
+        print(f"{Colors.GREEN}      ✔ Response already cached on first request (rare but possible){Colors.RESET}")
     else:
-        print(f"{Colors.YELLOW} ↳ Not cached yet (X-Cache: miss). Retesting...{Colors.RESET}")
+        print(f"{Colors.YELLOW}     ↳ Not cached yet (X-Cache: miss). Retesting...{Colors.RESET}")
 
     # 3) Re-request to confirm HIT
     resp3 = fetch_raw_headers(modified_url_for_cache)
     cached_after = is_cached(resp3.headers)
 
     if cached_after:
-        print(f"{Colors.GREEN}  ✔ Cache rule detected for *.js extension !{Colors.RESET}")
+        print(f"{Colors.GREEN}✔ Cache rule detected for *.js extension !{Colors.RESET}")
         print(f"{Colors.CYAN}→ The cache interprets the path literally as /{endpoint}/abc.js{Colors.RESET}")
         print(f"{Colors.GREEN}→ PATH MAPPING DISCREPANCY CONFIRMED 🔥{Colors.RESET}")
 
@@ -172,35 +165,34 @@ def test_path_mapping_dis(url, base_resp):
         }
 
     else:
-        print(f"{Colors.RED}✘ No cache hit after second request. No mapping discrepancy.{Colors.RESET}")
+        print(f"{Colors.RED}✘ No cache hit after second request. {Colors.BOLD}No mapping discrepancy.{Colors.RESET}")
         return False
 
-def test_delimiters_dis(url, base_resp):
+def test_delimiters_discrepancy(url, base_resp):
     delim_hits = []
     cache_hits_url = []
     
     print(f"\n{Colors.BLUE}{Colors.BOLD}[2] Testing delimiters...{Colors.RESET}")
     
     for d in DELIMITERS:
-        test_url = f"{url.rstrip('/')}{d}test"
+        test_url = f"{url.rstrip('/')}{d}test.js"
         modified_resp = fetch_raw_headers(test_url)
 
         if not responses_similar(base_resp, modified_resp):
             continue
                 
         cached = is_cached(modified_resp.headers)
-        print(test_url)
-        print(modified_resp.headers)
+      
         if cached:
-            cache_hits_url.append[d]
+            cache_hits_url.append(test_url)
 
         delim_hits.append(d)
 
     
     return delim_hits, cache_hits_url
-        
-def test_origin_normalization_dis(url, base_resp, cookies=None):
-    print(f"\n{Colors.BLUE}{Colors.BOLD}[3] Testing ORIGIN normalization{Colors.RESET}\n")
+
+def test_origin_normalization_discrepancy(url, base_resp, cookies=None):
+    print(f"\n{Colors.BLUE}{Colors.BOLD}[3] Testing ORIGIN normalization{Colors.RESET}")
 
     normals = ["../", "..%2f", "%2e%2e%2f"]
     dirs_cache_found = []
@@ -219,13 +211,13 @@ def test_origin_normalization_dis(url, base_resp, cookies=None):
         normals_found.append(n)
 
         print(f"{Colors.GREEN}[+] Origin NORMALIZATION detected with payload: {n}{Colors.RESET}")
-        print(f"{Colors.CYAN}    → Origin rewrote {test_url} to /{endpoint}{Colors.RESET}")
+        print(f"{Colors.CYAN}       → Origin rewrote {test_url} to /{endpoint}{Colors.RESET}")
         
         cached = is_cached(modified_resp.headers)
 
         if not cached:
-            print(f"{Colors.RED}    ✘ But no cache found")
-            print(f"{Colors.BLUE}   ⮡ Checking static dir for cache...{Colors.RESET}")
+            print(f"{Colors.RED}        ✘ But no cache found")
+            print(f"{Colors.BLUE}       ⮡ Checking static dir for cache...{Colors.RESET}")
             
             for sd in STATIC_DIRS:
                 test_url = f"{url.rsplit('/',1)[0]}/{sd}/{n}{endpoint}"
@@ -233,11 +225,11 @@ def test_origin_normalization_dis(url, base_resp, cookies=None):
             
                 cached = is_cached(modified_resp.headers)
                 if cached:
-                    print(f"{Colors.GREEN}{Colors.BOLD}    ✔ Cache found! Try this payload: {test_url}{Colors.RESET}")
+                    print(f"{Colors.CYAN}{Colors.BOLD}      ✔ Cache found! Try this payload: {test_url}{Colors.RESET}")
                     dirs_cache_found.append(test_url)
             
             if not dirs_cache_found: 
-                print(f"{Colors.RED}     → No static dir work{Colors.RESET}")
+                print(f"{Colors.RED}        → No static dir work{Colors.RESET}")
 
 
     return normals_found, dirs_cache_found
@@ -245,8 +237,144 @@ def test_origin_normalization_dis(url, base_resp, cookies=None):
     # print(f"{Colors.RED}[-] No ORIGIN normalization.{Colors.RESET}")
     # return False
 
+def test_cache_normalization_discrepancy(url, base_resp, delimiters, cookies=None):
+    print(f"\n{Colors.BLUE}{Colors.BOLD}[4] Testing CACHE normalization discrepancy{Colors.RESET}")
+
+    encoded_normals = [
+        "%2f%2e%2e%2f",   # /../
+        "%2F%2E%2E%2F",
+        "%2f..%2f", 
+        "%2f%2e%2e/",
+        "%2f%2e/", 
+    ]
+
+    candidate_payloads = []
+    exploitable = []
+  
+
+    endpoint = url.rstrip("/").split("/")[-1]
+    parent = url.rstrip("/").rsplit("/", 1)[0]
+
+    print(f"{Colors.CYAN}  ↳ Checking if cache resolves encoded dot-segments...{Colors.RESET}")
+
+    for enc in encoded_normals:
+        for d in delimiters:
+            for sd in STATIC_DIRS:
+                # Ex payload: /dynamic%encoded../static-dir
+                test_url = f"{parent}/{endpoint}{d}{enc}{sd}?wcd"
+                modified_resp = fetch_raw_headers(test_url, cookies=cookies)
+              
+                if not responses_similar(base_resp, modified_resp):
+                    continue
+
+                cached = is_cached(modified_resp.headers)
+                if cached:
+                    candidate_payloads.append(test_url)
+             
+
+    return candidate_payloads
+          
+def worker_test_cache_norm(url, enc, d, sd, base_resp, cookies=None):
+    """
+    Worker : teste UNE combinaison (enc, delimiter, static-dir)
+    et renvoie l'URL exploitable ou None
+    """
+    endpoint = url.rstrip("/").split("/")[-1]
+    parent = url.rstrip("/").rsplit("/", 1)[0]
+
+    test_url = f"{parent}/{endpoint}{d}{enc}{sd}?wcd"
+    modified_resp = fetch_raw_headers(test_url, cookies=cookies)
+
+    # doit matcher la réponse dynamique → même comportement que base_resp
+    if not responses_similar(base_resp, modified_resp):
+        return None
+
+    # mais doit être mis en cache
+    if is_cached(modified_resp.headers):
+        return test_url
+
+    return None
+
+def test_cache_normalization_discrepancy_parallel(
+    url, base_resp, delimiters, cookies=None, max_threads=20
+):
+    print(f"\n{Colors.BLUE}{Colors.BOLD}[4] Testing CACHE normalization discrepancy (parallel){Colors.RESET}")
+
+    encoded_normals = [
+        "%2f%2e%2e%2f",
+        "%2F%2E%2E%2F",
+        "%2f..%2f",
+        "%2f%2e%2e/",
+        "%2f%2e/",
+    ]
+
+    print(f"{Colors.CYAN}  ↳ Checking if cache resolves encoded dot-segments...{Colors.RESET}")
+
+    tasks = []
+    candidate_payloads = []
+
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        for enc in encoded_normals:
+            for d in delimiters:
+                for sd in STATIC_DIRS:
+                    tasks.append(
+                        executor.submit(
+                            worker_test_cache_norm,
+                            url, enc, d, sd, base_resp, cookies
+                        )
+                    )
+
+        for future in as_completed(tasks):
+            try:
+                result = future.result()
+                if result:
+                    candidate_payloads.append(result)
+            except Exception as e:
+                print(f"{Colors.RED}[ERR] Worker failed: {e}{Colors.RESET}")
+
+    return candidate_payloads
 
 
+def test_web_cache_deception(target:str, cookies:str=None):
+    base_url = target.rstrip("/")
+    base_resp = fetch_raw_headers(base_url)
+
+    # Test 1: 
+    path_mapping_result = test_path_mapping_discrepancy(base_url, base_resp)
+    
+    if path_mapping_result and path_mapping_result['success']:
+        return
+
+    # Test 2
+    delimiters_hits, cache_hits_url = test_delimiters_discrepancy(target, base_resp)
+
+    if delimiters_hits and cache_hits_url:
+        print(Colors.GREEN + f"     ✓ Delimiter match and cache found!{Colors.RESET}")
+        for c in cache_hits_url:
+            print(Colors.CYAN + "     -> Try this payload: ", c, Colors.RESET)
+        return
+        
+    print(Colors.YELLOW +   f"  ✓ Delimiter match: {{{', '.join(delimiters_hits)}}}{Colors.RESET}")
+    print(Colors.RED +      "   ✘ But no cache found" + Colors.RESET)
+
+    # Test 3
+    origin_normal_payloads, dirs_cache_found = test_origin_normalization_discrepancy(target, base_resp)
+
+    if origin_normal_payloads and dirs_cache_found:
+        return
+
+    # Test 4
+    if delimiters_hits:
+        cache_normal_payloads = test_cache_normalization_discrepancy_parallel(target, base_resp, delimiters_hits)
+        
+        if cache_normal_payloads:
+            print(f"{Colors.GREEN}  ✓ Exploitable cache discrepancy paths found!{Colors.RESET}")
+            print(f"{Colors.BLUE}  ↳ Found {len(cache_normal_payloads)} exploitable payloads:{Colors.RESET}")
+            for cnp in cache_normal_payloads:
+                print(f"{Colors.CYAN}      → {cnp}{Colors.RESET}")
+        else:
+            print(f"{Colors.RED}    ✘ No cache normalization discrepancy found{Colors.RESET}")
+  
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minimal Path Mapping Discrepancy Fuzzer (Burp-free)")
     parser.add_argument( "-t", "--target", required=True, help="Target base URL, e.g. http://example.com/item/123")
@@ -260,24 +388,13 @@ if __name__ == "__main__":
         idx = sys.argv.index("-c")
         cookies = dict([sys.argv[idx+1].split("=", 1)])
 
-    base_url = target.rstrip("/")
-    base_resp = fetch_raw_headers(base_url)
+    start = time.perf_counter()
 
-    # path_mapping_result = test_path_mapping_dis(base_url, base_resp)
-
-    # if path_mapping_result['success']:
-    #     exit()
-
-    delimiters_hits, cache_hits_url = test_delimiters_dis(target, base_resp)
-
-    if delimiters_hits and cache_hits_url:
-        color = Colors.GREEN
-        print(color + f"[+] Delimiter match and cache found!")
-        for c in cache_hits_url:
-            print(color + "     -> Try this payload: ", cache_hits_url)
-        
-    print(Colors.YELLOW + f"[+] Delimiter match: {{{', '.join(delimiters_hits)}}} but no cache found" + Colors.RESET)
-
-    # test_origin_normalization_dis(target, base_resp)
+    test_web_cache_deception(target)
     
+    end = time.perf_counter()
+    elapsed_sec = end - start
+    elapsed_min = elapsed_sec / 60
 
+    print(f"\nExecution time: {elapsed_min:.2f} min ({elapsed_sec:.2f} sec)")
+        
