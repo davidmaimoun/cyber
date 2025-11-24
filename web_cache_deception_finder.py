@@ -55,6 +55,9 @@ DELIMITERS = [
     "%5E","%5F","%60","%7B","%7C","%7D","%7E",
 ]
 
+STATIC_EXTENSIONS = [
+    ".js", ".css", ".png", ".jpg", ".jpeg", ".ico", ".svg", ".json"
+]
 
 def fetch(url, cookies=None):
     try:
@@ -72,7 +75,6 @@ def fetch_raw_headers(url, cookies=None):
     http = urllib3.PoolManager()
     resp = http.request("GET", url, redirect=False)
     return resp
-
 
 def clean(resp_data):
     try:
@@ -167,6 +169,76 @@ def test_path_mapping_discrepancy(url, base_resp):
     else:
         print(f"{Colors.RED}✘ No cache hit after second request. {Colors.BOLD}No mapping discrepancy.{Colors.RESET}")
         return False
+
+def test_one_mapping(url, ext, endpoint, base_resp, cookies=None):
+    """
+    Worker: test un seul type de payload en parallèle.
+    """
+    payloads = []
+
+    parent = url.rstrip("/").rsplit("/", 1)[0]
+
+    candidates = [
+        f"{url.rstrip('/')}/abc{ext}",          # /endpoint/abc.js
+        f"{parent}/{endpoint}{ext}",            # /endpoint.js
+        f"{parent}/{endpoint}%2fabc{ext}",      # /endpoint%2fabc.js
+    ]
+
+    for test_url in candidates:
+        modified_resp = fetch_raw_headers(test_url, cookies=cookies)
+        cached = is_cached(modified_resp.headers)
+
+        # On valide uniquement si le cache voit le fichier comme statique
+        if cached:
+            payloads.append(test_url)
+
+    return payloads
+
+def test_path_mapping_discrepancy_parallel(url, base_resp, cookies=None, max_threads=15):
+    print(f"{Colors.BLUE}{Colors.BOLD}\n[1] Detecting PATH MAPPING discrepancies (Parallel)...{Colors.RESET}")
+
+    endpoint = url.rstrip("/").split("/")[-1]
+
+    # --- Test ORIGIN PATH ABSTRACTION ---
+    print(f"{Colors.BLUE}→ Testing origin path abstraction...{Colors.RESET}")
+    test_url_1 = f"{url.rstrip('/')}/abc"
+    modified_resp_1 = fetch_raw_headers(test_url_1, cookies=cookies)
+
+    if not responses_similar(base_resp, modified_resp_1):
+        print(f"{Colors.RED}✘ Origin does NOT abstract path → No mapping discrepancy.{Colors.RESET}")
+        return []
+
+    print(f"{Colors.GREEN}✔ Origin abstracts /{endpoint}/abc → /{endpoint}{Colors.RESET}")
+
+    # --- Parallel testing of static extensions ---
+    print(f"{Colors.BLUE}→ Testing cache behavior on static extensions in parallel...{Colors.RESET}")
+
+    found_payloads = []
+
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = {
+            executor.submit(
+                test_one_mapping, url, ext, endpoint, base_resp, cookies
+            ): ext for ext in STATIC_EXTENSIONS
+        }
+
+        for future in as_completed(futures):
+            ext = futures[future]
+            try:
+                results = future.result()
+                for payload in results:
+                    print(f"{Colors.GREEN}  ✔ Cache HIT for {payload}{Colors.RESET}")
+                    found_payloads.append(payload)
+
+            except Exception as e:
+                print(f"[ERR] Extension {ext}: {e}")
+
+    if found_payloads:
+        print(f"{Colors.GREEN}{Colors.BOLD}\n🔥 PATH MAPPING DISCREPANCY CONFIRMED!{Colors.RESET}")
+        return found_payloads
+
+    print(f"{Colors.RED}✘ No static extension produced a cache discrepancy.{Colors.RESET}")
+    return []
 
 def test_delimiters_discrepancy(url, base_resp):
     delim_hits = []
@@ -335,12 +407,16 @@ def test_cache_normalization_discrepancy_parallel(
     return candidate_payloads
 
 
-def test_web_cache_deception(target:str, cookies:str=None):
+def test_web_cache_deception(target:str, not_aggressive=False, cookies:str=None):
     base_url = target.rstrip("/")
     base_resp = fetch_raw_headers(base_url)
 
     # Test 1: 
-    path_mapping_result = test_path_mapping_discrepancy(base_url, base_resp)
+    if not_aggressive:
+        path_mapping_result = test_path_mapping_discrepancy(base_url, base_resp)
+    else:
+        path_mapping_result = test_path_mapping_discrepancy_parallel(base_url, base_resp)
+
     
     if path_mapping_result and path_mapping_result['success']:
         return
@@ -365,7 +441,11 @@ def test_web_cache_deception(target:str, cookies:str=None):
 
     # Test 4
     if delimiters_hits:
-        cache_normal_payloads = test_cache_normalization_discrepancy_parallel(target, base_resp, delimiters_hits)
+        if not_aggressive:
+            cache_normal_payloads = test_cache_normalization_discrepancy(target, base_resp, delimiters_hits)
+
+        else:
+            cache_normal_payloads = test_cache_normalization_discrepancy_parallel(target, base_resp, delimiters_hits)
         
         if cache_normal_payloads:
             print(f"{Colors.GREEN}  ✓ Exploitable cache discrepancy paths found!{Colors.RESET}")
@@ -378,6 +458,7 @@ def test_web_cache_deception(target:str, cookies:str=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minimal Path Mapping Discrepancy Fuzzer (Burp-free)")
     parser.add_argument( "-t", "--target", required=True, help="Target base URL, e.g. http://example.com/item/123")
+    parser.add_argument( "-s", "--slow", action='store_true', help="No parallelization, not aggressive")
     
     args = parser.parse_args()
 
@@ -390,11 +471,11 @@ if __name__ == "__main__":
 
     start = time.perf_counter()
 
-    test_web_cache_deception(target)
+    test_web_cache_deception(target, args.slow)
     
     end = time.perf_counter()
     elapsed_sec = end - start
     elapsed_min = elapsed_sec / 60
 
-    print(f"\nExecution time: {elapsed_min:.2f} min ({elapsed_sec:.2f} sec)")
+    print(f"\n{Colors.BLUE}Test Execution time: {elapsed_min:.2f} min ({elapsed_sec:.2f} sec)\n")
         
