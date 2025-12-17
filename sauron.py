@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import asyncio
 import argparse
-import datetime
+import json
 import re
+import datetime
 import os
-import hashlib
-from typing import Optional
+from collections import Counter, defaultdict
 import httpx
 
+# ================= COLORS & LEVELS =================
 class Colors:
     RED    = "\033[91m"
     GREEN  = "\033[92m"
@@ -30,9 +31,10 @@ KEY_URL      = 'url'
 KEY_LEVEL    = 'level'
 KEY_EMAIL    = 'email'
 
+# ================= LOGGING =================
 LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, f"sauron_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+LOG_FILE = os.path.join(LOG_DIR, f"sauron_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt")
 
 def log(msg: str):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -64,514 +66,227 @@ def out_results(results: dict):
         
         if key == KEY_USERNAME or key == KEY_USERNAMES_PROBABLES:
             if val:  
-                
-                platform_width = max(len(v[KEY_PLATFORM]) for v in val) + 2 
-                level_width = 12  
-                url_width = 40    
+                platform_width = max(len(v[KEY_PLATFORM]) for v in val) + 2
+                level_width = max(len(v[KEY_LEVEL]) for v in val) + 2  # dynamique selon le texte
+                url_width = 40
 
                 # Header
-                print(f"{'Platform'.ljust(platform_width)}  {'Probability'.ljust(level_width)}  URL")
-                print(f"{'-'*platform_width} {'-'*level_width} {'-'*url_width}")
+                print(f"{ 'Platform'.ljust(platform_width)}  {'Level'.ljust(level_width)}  URL")
+                print(f"{'-'*platform_width}  {'-'*level_width}  {'-'*url_width}")
 
                 # Rows
                 for v in val:
                     platform = v[KEY_PLATFORM].capitalize().ljust(platform_width)
-                    level_color = out_level_color(v[KEY_LEVEL]).ljust(22 + len(Colors.RESET))  # ajuste la couleur
-                    url = v[KEY_URL]
-                    print(f"{platform}   {level_color} {Colors.BLUE}{url}{Colors.RESET}")
-        
-# ======= UTIL =======
-def derive_usernames(email: str) -> list[str]:
-    local = email.split("@")[0]
+                    level_text = v[KEY_LEVEL].ljust(level_width)
+                    # Appliquer couleur sans décaler
+                    if v[KEY_LEVEL] == Level.HIGH:
+                        level_color = f"{Colors.BOLD}{Colors.GREEN}{level_text}{Colors.RESET}"
+                    elif v[KEY_LEVEL] == Level.MEDIUM:
+                        level_color = f"{Colors.BOLD}{Colors.ORANGE}{level_text}{Colors.RESET}"
+                    else:
+                        level_color = f"{Colors.BOLD}{Colors.CYAN}{level_text}{Colors.RESET}"
 
+                    url = v[KEY_URL]
+                    print(f"{platform}   {level_color}  {Colors.BLUE}{url}{Colors.RESET}")
+
+
+# ================= UTILITIES =================
+def derive_usernames(email: str):
+    local = email.split("@")[0]
     candidates = [
         local,
         local.replace(".", ""),
         local.replace("_", ""),
     ]
-
     return list(dict.fromkeys(candidates))
 
 def generate_username(firstname: str, lastname: str):
     return f"{firstname}{lastname}".lower()
 
+
+# ================= LOAD SITES =================
+def load_sites():
+    with open("data.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ================= CHECK ENGINE =================
+async def check_site(site_name, site_cfg, username):
+    if site_cfg.get("force_lowercase"):
+        username = username.lower()
+
+    # URL pour affichage et test
+    url_display = site_cfg["url"].format(username)
+    url_probe = site_cfg.get("urlProbe", site_cfg["url"]).format(username)
+
+    response_type = site_cfg.get("responseType", "status_code")
+    response_error = site_cfg.get("responseError")
+    response_success = site_cfg.get("responseSuccess")
+    regex_check = site_cfg.get("regexCheck")
     
-async def check_github(username: str) -> dict:
-    url = f"https://github.com/{username}"
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            r = await client.get(url)
-            if r.status_code == 200:
-                return {
-                    "found": True,
-                    "platform": "github",
-                    "username": username,
-                    "url": url,
-                    "level": Level.HIGH 
-                }
-        except Exception:
-            pass
-
-    return None
-
-async def check_reddit(username: str) -> dict:
-    url = f"https://www.reddit.com/user/{username}/about.json"
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        )
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(url, headers=headers)
-
-        if r.status_code == 404:
-            return None
-
-        data = r.json()
-
-        if "error" in data:
-            return None
-
-        return {
-            "found": True,
-            "platform": "reddit",
-            "username": username,
-            "url": f"https://www.reddit.com/user/{username}",
-            "level": Level.HIGH
-        }
-
-    except Exception as e:
+    # Vérification regex si définie
+    if regex_check and not re.match(regex_check, username):
         return None
-      
-async def check_gravatar(email: str) -> dict | None:
-    email = email.strip().lower()
-    email_hash = hashlib.md5(email.encode()).hexdigest()
-    url = f"https://www.gravatar.com/avatar/{email_hash}?d=404"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "gravatar",
-                "email": email,
-                "url": url
-            }
-
-    except Exception:
-        pass
-
-    return None
-
-async def check_linkedin(username: str) -> dict:
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    profile_url = f"https://www.linkedin.com/in/{username}/"
-    search_url  = f"https://www.linkedin.com/search/results/people/?keywords={username}&origin=GLOBAL_SEARCH_HEADER"
-
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        try:
-            r = await client.get(profile_url, headers=headers)
-            if r.status_code == 200 and "linkedin.com/in/" in str(r.url):
-                return {
-                    "found": True,
-                    "platform": "linkedin",
-                    "username": username,
-                    "url": str(r.url),
-                    "level": Level.HIGH
-                }
-        except Exception:
-            pass
-
-        # 2) Try search
-        try:
-            r = await client.get(search_url, headers=headers)
-            if r.status_code == 200 and "search" in r.text.lower():
-                return {
-                    "found": True,
-                    "platform": "linkedin",
-                    "username": username,
-                    "url": search_url,
-                    "level": Level.LOW
-                }
-        except Exception:
-            pass
-
-    return None
-
-async def check_hibp(email: str, api_key: str) -> dict | None:
-    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
-    headers = {"hibp-api-key": api_key, "User-Agent": "OSINT-Scanner"}
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=headers)
-
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "HIBP",
-                "email": email,
-                "url": f"https://haveibeenpwned.com/account/{email}",
-                "level": Level.HIGH
-            }
-        elif r.status_code == 404:
-            return None
-    except Exception:
-        pass
-    return None
-
-async def check_x(username: str) -> dict | None:
-    url = f"https://x.com/{username}"  # Formerly twitter
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(url, headers=headers)
-            if r.status_code == 200:
-                return {
-                    "found": True,
-                    "platform": "X",
-                    "username": username,
-                    "url": url,
-                    "level": Level.HIGH
-                }
-    except Exception:
-        pass
-    return None
-
-async def check_twitch(username: str) -> dict | None:
-    url = f"https://www.twitch.tv/{username}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    
 
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            r = await client.get(url, headers=headers)
+            r = await client.get(url_probe)
+         
 
-        if r.status_code != 200:
-            return None
-
-        # Vérifier le titre exact
-        title_match = re.search(rf'<title>\s*{re.escape(username)}\s*-\s*Twitch\s*</title>', r.text, re.IGNORECASE)
-        if title_match:
-            return {
-                "found": True,
-                "platform": "twitch",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-
-    except Exception:
-        return None
-
-async def check_mastodon(username: str, instance: str = "mastodon.social") -> dict | None:
-    url = f"https://{instance}/@{username}"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "mastodon",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-async def check_gitlab(username: str) -> dict | None:
-    url = f"https://gitlab.com/{username}"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "gitLab",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-async def check_keybase(username: str) -> dict | None:
-    url = f"https://keybase.io/{username}"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "Keybase",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-async def check_medium(username: str) -> dict | None:
-    url = f"https://medium.com/@{username}"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "medium",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-async def check_devto(username: str) -> dict | None:
-    url = f"https://dev.to/{username}"
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "dev.to",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-async def check_youtube(username: str) -> dict | None:
-    url = f"https://www.youtube.com/@{username}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=headers)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "youtube",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-async def check_tryhackme(username: str) -> dict | None:
-    url = f"https://tryhackme.com/p/{username}"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    NEGATIVE_MARKERS = [
-        "nothing to see here",
-        "this page doesn't exist",
-        "page not found",
-        "404"
-    ]
-
-    try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            r = await client.get(url, headers=headers)
-
-        if r.status_code != 200:
-            return None
-
-        text = r.text.lower()
-        print(r.text)
-
-        for marker in NEGATIVE_MARKERS:
-            if marker in text:
+        # ===== STATUS CODE =====
+        if response_type == "status_code":
+            valid_codes = site_cfg.get("validStatus", [200])
+            if isinstance(valid_codes, int):
+                valid_codes = [valid_codes]
+            if r.status_code not in valid_codes:
                 return None
 
+        # ===== MESSAGE DANS LE BODY =====
+        elif response_type == "message":
+            error_msg = site_cfg.get("responseError", "")
+            if error_msg in r.text:
+                return None
+
+        # ===== JSON =====
+        elif response_type == "json":
+            try:
+                data = r.json()
+            except Exception:
+                return None
+
+            # Vérifie succès ou erreur
+            if response_error:
+                match_error = all(data.get(k) == v for k, v in response_error.items())
+                if match_error:
+                    return None
+            if response_success:
+                match_success = all(data.get(k) == v for k, v in response_success.items())
+                if not match_success:
+                    return None
+
+        # ===== HTML CHECK =====
+        elif response_type == "html":
+            html_check = site_cfg.get("htmlCheck", "").format(username)
+            if html_check.lower() not in r.text.lower():
+                return None
+
+        # ===== DEFAULT =====
+        else:
+            if r.status_code != 200:
+                return None
+
+        # Niveau de confiance
+        conf = site_cfg.get("confidence", 50)
+        level = Level.HIGH if conf >= 90 else Level.MEDIUM if conf >= 70 else Level.LOW
+
         return {
-            "found": True,
-            "platform": "tryhackme",
+            "platform": site_name,
             "username": username,
-            "url": url,
-            "level": Level.LOW
+            "url": url_display,  # URL pour navigation réelle
+            "level": level,
+            "confidence": conf,
+            "tags": site_cfg.get("tags", []),
         }
 
     except Exception:
         return None
 
-async def check_instagram(username: str) -> dict | None:
-    url = f"https://www.instagram.com/{username}/"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=headers)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "instagram",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-async def check_discord(username: str) -> dict | None:
-    """
-    Vérifie si un utilisateur Discord existe via l'URL publique de profil (si disponible).
-    """
-    url = f"https://discord.com/users/{username}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=headers)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "discord",
-                "username": username,
-                "url": url,
-                "level": Level.HIGH
-            }
-    except Exception:
-        pass
-    return None
-
-
-async def check_hibp(email: str, api_key: str) -> dict | None:
-    """
-    Check if email has been pwned using HaveIBeenPwned API.
-    Requires an API key from https://haveibeenpwned.com/API/Key
-    """
-    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}"
-    headers = {
-        "hibp-api-key": api_key,
-        "user-agent": "SauronEye/1.0"
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, headers=headers)
-        if r.status_code == 200:
-            return {
-                "found": True,
-                "platform": "hibp",
-                "email": email,
-                "breaches": r.json()  # liste des breaches
-            }
-        elif r.status_code == 404:
-            return None
-    except Exception as e:
-        print(f"HIBP error: {e}")
-    return None
-
-
-# ======= Checkers ===========
-
-async def check_username(username: str) -> dict:
-    tasks = [
-        check_github(username),
-        check_reddit(username),
-        check_linkedin(username),
-        check_x(username),
-        check_instagram(username),
-        check_youtube(username),
-        check_twitch(username),
-        check_discord(username),
-        check_tryhackme(username),
-        check_mastodon(username),
-        check_gitlab(username),
-        check_keybase(username),
-        check_medium(username),
-        check_devto(username)
-    ]
-    
+# ================= USERNAME SCAN =================
+async def scan_username(username):
+    sites = load_sites()
+    tasks = [check_site(site, site_config, username) for site, site_config in sites.items()]
     results = await asyncio.gather(*tasks)
-
     return [r for r in results if r]
 
-async def check_email(email: str, hibp_api_key: str = None) -> list | None:
-    tasks = [check_gravatar(email)]
-    if hibp_api_key:
-        tasks.append(check_hibp(email, hibp_api_key))
 
-    results = await asyncio.gather(*tasks)
-
-    # Filter out None
-    found = [r for r in results if r is not None]
-    return found if found else None
-
-async def check_all(username: Optional[str]=None, email: Optional[str]=None, firstname: Optional[str]=None, lastname: Optional[str]=None):
+# ================= USERNAME GENERATION =================
+async def generate_and_scan(username=None, email=None, firstname=None, lastname=None):
     results = {}
-    tasks = {}
-
-    if firstname and lastname:
-        username = generate_username(firstname, lastname)
-        
     if username:
-        username = username.replace("-", "").replace("_", "")
-        tasks["username"] = check_username(username)
-
-    if email:
-        tasks["email"] = check_email(email)
-        
-        if not username:
-            usernames = derive_usernames(email)
-
-            for u in usernames:
-                tasks["usernames_probables"] = check_username(u)
-
-
-    # for u in usernames:
-
-    if tasks:
-        completed = await asyncio.gather(*tasks.values())
-        results = dict(zip(tasks.keys(), completed))
-
+        results["username"] = await scan_username(username)
+    else:
+        generated = []
+        if firstname and lastname:
+            generated.append(generate_username(firstname, lastname))
+        if email:
+            generated.extend(derive_usernames(email))
+        results["usernames_probables"] = []
+        for u in generated:
+            res = await scan_username(u)
+            results["usernames_probables"].extend(res)
     return results
 
+# ================= SCORING & PROFILING =================
+def compute_score(results):
+    if not results:
+        return 0
+    base = sum(r["confidence"] for r in results) / len(results)
+    diversity = len({r["platform"] for r in results})
+    return min(100, int(base + diversity * 2))
 
-# ======= MAIN ENTRY =======
-async def run_scan(args):
-    out("\nSAURON EYE STARTED\n", Colors.BOLD)
+def profiling(results):
+    tag_count = Counter()
+    for r in results:
+        tag_count.update(r["tags"])
+    if not tag_count:
+        return {"profile": "unknown", "details": {}}
+    dominant = tag_count.most_common(1)[0][0]
+    return {"profile": dominant, "details": dict(tag_count)}
 
-    results = await check_all(args.username, args.email, args.firstname, args.lastname)
+def correlation(results):
+    platforms = [r["platform"] for r in results]
+    tags = defaultdict(list)
+    for r in results:
+        for t in r["tags"]:
+            tags[t].append(r["platform"])
+    return {"platforms": platforms, "tag_map": dict(tags)}
+
+
+async def run_scan(username=None, email=None, firstname=None, lastname=None):
+    out("\n👁️ SAURON EYE STARTED\n", Colors.BOLD)
+    results = await generate_and_scan(username=username, email=email, firstname=firstname, lastname=lastname)
+    
     out_results(results)
 
-    out(f"\nLog saved to {LOG_FILE}", Colors.YELLOW)
-    out("\nSAURON EYE DONE\n", Colors.BOLD)
+    # Combine all results for analysis
+    all_res = []
+    for k in results:
+        all_res.extend(results[k])
 
+    score = compute_score(all_res)
+    profile = profiling(all_res)
+    corr = correlation(all_res)
+
+    out("\n[Profiling]", Colors.CYAN, bold=True)
+    out(f"{Colors.BLUE}For the target: {username}")
+    out(f"Confidence score : {score}/100", Colors.CYAN)
+    out(f"Dominant profile : {profile['profile']}", Colors.CYAN)
+    out("Interests:", Colors.CYAN)
+    for k, v in profile["details"].items():
+        out(f"  - {k}: {v}", Colors.YELLOW)
+
+    out("\nPlatforms: " + ", ".join(corr["platforms"]), Colors.BLUE)
+    log(json.dumps({
+        "username": username,
+        "email": email,
+        "results": all_res,
+        "score": score,
+        "profile": profile,
+        "correlation": corr
+    }, indent=2))
+    out("\n👁️ SAURON EYE DONE\n", Colors.BOLD)
+
+# ================= ARGUMENTS =================
 def main():
     parser = argparse.ArgumentParser(description="Sauron Eye OSINT Scanner")
     parser.add_argument("--username", type=str, help="Username to scan")
     parser.add_argument("--email", type=str, help="Email to scan")
-    parser.add_argument("--firstname", type=str, help="Firstname for LinkedIn")
-    parser.add_argument("--lastname", type=str, help="Lastname for LinkedIn")
+    parser.add_argument("--firstname", type=str, help="Firstname")
+    parser.add_argument("--lastname", type=str, help="Lastname")
     args = parser.parse_args()
 
-    asyncio.run(run_scan(args))
+    asyncio.run(run_scan(username=args.username, email=args.email, firstname=args.firstname, lastname=args.lastname))
 
 if __name__ == "__main__":
     main()
