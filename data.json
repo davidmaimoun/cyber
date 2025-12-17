@@ -1,0 +1,84 @@
+{
+  "GitHub": {
+    "url": "https://github.com/{}",
+    "errorType": "status_code",
+    "regexCheck": "^[a-zA-Z0-9-]{1,39}$",
+    "confidence": 100,
+    "tags": ["tech", "dev"]
+  },
+
+  "GitLab": {
+    "url": "https://gitlab.com/{}",
+    "urlProbe": "https://gitlab.com/api/v4/users?username={}",
+    "errorType": "message",
+    "errorMsg": "[]",
+    "confidence": 90,
+    "tags": ["tech", "dev"]
+  },
+
+
+  "Reddit": {
+    "url": "https://www.reddit.com/user/{}",
+    "urlProbe": "https://www.reddit.com/user/{}/about.json",
+    "responseType": "json",
+    "responseError": {"error": 404},
+    "confidence": 85,
+    "tags": ["social", "culture"]
+  },
+
+  "TryHackMe": {
+    "url": "https://tryhackme.com/p/{}",
+    "urlProbe": "https://tryhackme.com/api/user/exist/{}",
+    "regexCheck": "^[a-zA-Z0-9.]{1,16}$",
+    "responseType": "json",
+    "responseSuccess": {"success": true},
+    "responseError": {"success": false},
+    "confidence": 95,
+    "tags": ["tech", "cyber"]
+  },
+
+  "YouTube": {
+    "url": "https://www.youtube.com/@{}",
+    "errorType": "status_code",
+    "confidence": 70,
+    "tags": ["media", "culture"]
+  },
+
+  "Twitch": {
+    "url": "https://www.twitch.tv/{}",
+    "errorType": "html",
+    "htmlCheck": "<title>{} - Twitch</title>",
+    "confidence": 85,
+    "tags": ["media", "gaming"]
+  },
+
+
+  "Mastodon": {
+    "url": "https://mastodon.social/@{}",
+    "errorType": "status_code",
+    "confidence": 80,
+    "tags": ["social"]
+  },
+
+  "Keybase": {
+    "url": "https://keybase.io/{}",
+    "errorType": "status_code",
+    "confidence": 90,
+    "tags": ["tech", "security"]
+  },
+
+  "Medium": {
+    "url": "https://medium.com/@{}",
+    "urlProbe": "https://medium.com/feed/@{}",
+    "errorType": "status_code",
+    "confidence": 75,
+    "tags": ["media", "culture"]
+  },
+
+  "Dev.to": {
+    "url": "https://dev.to/{}",
+    "errorType": "status_code",
+    "confidence": 85,
+    "tags": ["tech"]
+  }
+}
